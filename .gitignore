@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.pkl
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+
+# 数据/模型/日志
+*.pth
+*.pt
+*.h5
+*.ckpt
+*.npz
+*.npy
+*.log
+*.json
+inference_results/
+training_log.json
+
+# 数据集缓存
+nyu_depthv2_seg_dataset/*.npy
+nyu_depthv2_seg_dataset/*.npz
+
+# 临时文件
+*.tmp
+*.swp
+.DS_Store
+
+# 环境
+.env
+.venv
+
+# 数据集
+nyu_depthv2_seg_dataset
+# 其他
