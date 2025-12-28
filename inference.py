@@ -2,7 +2,8 @@ import torch
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
-from unet_model import UNetRGBD
+# from unet_model import UNetRGBD
+from resnet_unet import ResNetUNet
 from dataset import NYUDepthV2Dataset
 import os
 import random
@@ -24,19 +25,20 @@ def colorize_mask(mask, num_classes):
 def main():
     # 配置
     data_dir = 'nyu_depthv2_seg_dataset'
-    model_path = 'best_unet_rgbd.pth'
+    model_path = 'realsense_data/best_unet_rgbd.pth'
     output_dir = 'inference_results'
     os.makedirs(output_dir, exist_ok=True)
     
     # 设备
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda")
     print(f"Using device: {device}")    
     # 加载数据集获取类别数
     val_dataset = NYUDepthV2Dataset(data_dir, split='val')
     num_classes = val_dataset.num_classes
     
     # 加载模型
-    model = UNetRGBD(n_channels=4, n_classes=num_classes)
+    # model = UNetRGBD(n_channels=4, n_classes=num_classes)
+    model = ResNetUNet(n_channels=4, n_classes=num_classes)
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print("模型加载成功")
@@ -62,7 +64,16 @@ def main():
             
         # 准备可视化
         rgb = inputs[:3].permute(1, 2, 0).numpy()
+        # 反归一化 RGB: (x * std) + mean
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        rgb = std * rgb + mean
+        rgb = np.clip(rgb, 0, 1)
+        
         depth = inputs[3].numpy()
+        # 反归一化 Depth (可选，主要是为了显示正常范围)
+        # depth = depth * 0.5 + 0.5 
+        
         label = label.numpy()
         
         # 彩色化 Mask

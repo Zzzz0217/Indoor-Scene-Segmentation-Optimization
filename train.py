@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from unet_model import UNetRGBD
+from resnet_unet import ResNetUNet
 from dataset import NYUDepthV2Dataset
+from loss import DiceCELoss
 import os
 import time
 import json
@@ -12,7 +13,7 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 
 # 修改 train_model 函数以记录超参数和准确率
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=25, device=torch.device('cuda'), patience=10, accumulation_steps=8):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler=None, num_epochs=25, device=torch.device('cuda'), patience=10, accumulation_steps=8, start_epoch=0):
     since = time.time()
 
     best_mIoU = 0.0
@@ -34,11 +35,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     }
 
     num_classes = model.n_classes if hasattr(model, 'n_classes') else 41
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         print(f'Epoch {epoch}/{num_epochs - 1}')
         print('-' * 10)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current Learning Rate: {current_lr}")
 
-        epoch_record = {"epoch": epoch}
+        epoch_record = {"epoch": epoch, "learning_rate": current_lr}
 
         # 用于IoU统计
         iou_inter = {"train": np.zeros(num_classes, dtype=np.float64), "val": np.zeros(num_classes, dtype=np.float64)}
@@ -132,14 +136,27 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
             # deep copy the model and Early Stopping
             if phase == 'val':
+                # 保存最新的 checkpoint (包含优化器状态)
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'best_mIoU': best_mIoU
+                }
+                torch.save(checkpoint, 'latest_unet_rgbd.pth')
+
                 if mIoU > best_mIoU:
                     best_mIoU = mIoU
-                    torch.save(model.state_dict(), 'best_unet_rgbd.pth')
+                    torch.save(model.state_dict(), 'best_unet_rgbd.pth') # 保持 best 只存权重，方便推理脚本加载
                     print(f"New best mIoU: {best_mIoU:.4f}. Model saved!")
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
                     print(f"No improvement in mIoU for {epochs_no_improve} epochs.")
+
+        if scheduler:
+            scheduler.step()
 
         training_log["epoch_logs"].append(epoch_record)
         print()
@@ -183,10 +200,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     # all_labels = all_labels[mask]
 
     cm = confusion_matrix(all_labels, all_preds)
+    
+    # 调整绘图大小以容纳41个类别，防止内容挤在一起
+    fig, ax = plt.subplots(figsize=(24, 24))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=range(len(cm)))
-    disp.plot(cmap='Blues')
-    plt.title("Confusion Matrix")
-    plt.savefig("confusion_matrix.png")
+    
+    # 绘制混淆矩阵，旋转x轴标签，使用更大的字体
+    disp.plot(cmap='Blues', ax=ax, xticks_rotation='vertical', values_format='d')
+    
+    plt.title("Confusion Matrix", fontsize=20)
+    plt.tight_layout()
+    plt.savefig("confusion_matrix.png", dpi=300)
     print("Confusion matrix saved as confusion_matrix.png")
 
 def main():
@@ -194,13 +218,13 @@ def main():
     data_dir = 'nyu_depthv2_seg_dataset'
     # Batch Size: 显存允许的情况下越大越好。
     # 对于 640x480 输入，8GB 显存建议设为 4 或 8；16GB+ 可设为 16。
-    batch_size = 2
+    batch_size = 4
     learning_rate = 1e-3
     # Epochs: 分割任务通常需要较多轮次收敛。
     # 建议 30-50 轮。如果 Loss 还在下降，可以继续训练。
-    num_epochs = 30
-    patience = 10 # Early stopping patience
-    accumulation_steps = 8 # Gradient accumulation steps
+    num_epochs = 300
+    patience = 30 # Early stopping patience
+    accumulation_steps = 2 # Gradient accumulation steps (Effective batch size = 4 * 2 = 8)
     
     # 检测设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -210,35 +234,73 @@ def main():
     # 开启 use_40_classes=True 以减少显存占用
     train_dataset = NYUDepthV2Dataset(data_dir, split='train', use_40_classes=True)
     val_dataset = NYUDepthV2Dataset(data_dir, split='val', use_40_classes=True)
+    
+    # 获取类别数
+    num_classes = train_dataset.num_classes
+
+    # DEBUG: 仅使用 50 个样本
+    # print("DEBUG: Using subset of 50 samples for training and 20 for validation.")
+    # train_dataset = torch.utils.data.Subset(train_dataset, range(50))
+    # val_dataset = torch.utils.data.Subset(val_dataset, range(20))
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
-    print(f"Num classes: {train_dataset.num_classes}")
+    print(f"Num classes: {num_classes}")
 
     # 模型
     # 输入通道=4 (RGB+Depth), 输出通道=类别数
-    model = UNetRGBD(n_channels=4, n_classes=train_dataset.num_classes)
+    # model = UNetRGBD(n_channels=4, n_classes=num_classes)
+    print("Using ResNet34-UNet with pretrained weights...")
+    model = ResNetUNet(n_channels=4, n_classes=num_classes)
     model = model.to(device)
 
     # 计算类别权重以处理类别不平衡
-    # 这里使用简单的逆频率权重，或者你可以预先计算好更精确的权重
-    # 为了避免计算整个数据集的频率（耗时），这里给出一个经验性的加权策略：
-    # 背景类（0）权重设为 0.1 或更低，其他类设为 1.0
-    class_weights = torch.ones(train_dataset.num_classes, device=device)
-    class_weights[0] = 0.1  # 降低背景类的权重
+    # 全量数据集的类别权重
+    weights_list = [0.1074, 0.1360, 0.2747, 0.3607, 0.6980, 0.5546, 0.7115, 0.6986, 0.6427, 0.7275, 
+                0.5143, 0.6976, 1.0992, 1.0581, 0.8956, 0.8068, 0.9041, 1.2413, 1.4249, 1.3494, 
+                1.3991, 1.3374, 1.3044, 0.8456, 1.4286, 1.0235, 1.0936, 1.3718, 0.9806, 1.4100, 
+                1.2643, 1.4031, 0.8701, 1.3532, 1.2028, 1.2989, 0.9901, 1.2714, 1.4046, 1.4357, 1.4080]
+    class_weights = torch.tensor(weights_list, dtype=torch.float32).to(device)
     
-    # 损失函数和优化器
-    # 假设 0 是背景/未知，如果不需要忽略，去掉 ignore_index
-    # 如果显存不够，可以减小 batch_size
-    # 使用加权 CrossEntropyLoss
-    criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=0) 
+    # 损失函数
+    criterion = DiceCELoss(weight=class_weights, ignore_index=-100, label_smoothing=0.1, lambda_dice=1.0, lambda_ce=1.0)
+    
     # 使用 Adam 优化器并添加 L2 正则化 (weight_decay)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    
+    # 学习率调度器
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 100, 150, 200, 250], gamma=0.1)
+
+    # 尝试加载断点 (支持旧格式和新格式)
+    checkpoint_path = 'latest_unet_rgbd.pth'
+    start_epoch = 0
+    
+    if os.path.exists(checkpoint_path):
+        print(f"Resuming training from {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            # 检查是否是新格式 (包含 epoch, optimizer 等)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                print(f"Resumed from epoch {start_epoch}")
+            else:
+                # 旧格式 (仅 model state dict)
+                model.load_state_dict(checkpoint)
+                print("Resumed from legacy checkpoint (model weights only). Starting from epoch 0.")
+                
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}")
+            print("Starting from scratch.")
 
     # 开始训练
-    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=num_epochs, device=device, patience=patience, accumulation_steps=accumulation_steps)
+    train_model(model, train_loader, val_loader, criterion, optimizer, scheduler=scheduler, num_epochs=num_epochs, device=device, patience=patience, accumulation_steps=accumulation_steps, start_epoch=start_epoch)
 
 if __name__ == '__main__':
     main()

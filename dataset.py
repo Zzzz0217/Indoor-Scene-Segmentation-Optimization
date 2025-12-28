@@ -4,7 +4,9 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 import json
+import random
 
 class NYUDepthV2Dataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None, target_transform=None, use_40_classes=True):
@@ -72,19 +74,76 @@ class NYUDepthV2Dataset(Dataset):
         depth = Image.open(depth_path).convert('L') # 8-bit 灰度
         label = Image.open(label_path) # 保持原始模式 (通常是 L 或 P)
         
-        # --- 显存优化关键点 ---
-        # 如果显存依然不够，可以在这里缩小图像尺寸
-        # 例如缩小到 320x240
-        # rgb = rgb.resize((320, 240), Image.BILINEAR)
-        # depth = depth.resize((320, 240), Image.BILINEAR)
-        # label = label.resize((320, 240), Image.NEAREST)
+        # --- 数据增强 (仅训练集) ---
+        if self.split == 'train':
+            # 随机水平翻转
+            if random.random() > 0.5:
+                rgb = TF.hflip(rgb)
+                depth = TF.hflip(depth)
+                label = TF.hflip(label)
+            
+            # 随机旋转 (-10 ~ 10 度)
+            if random.random() > 0.5:
+                angle = random.uniform(-10, 10)
+                rgb = TF.rotate(rgb, angle)
+                depth = TF.rotate(depth, angle)
+                label = TF.rotate(label, angle, interpolation=transforms.InterpolationMode.NEAREST)
+
+            # 颜色抖动 (仅 RGB)
+            if random.random() > 0.5:
+                color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+                rgb = color_jitter(rgb)
+
+            # --- 强力增强: 随机缩放 + 裁剪 ---
+            # 模拟不同距离和视角
+            if random.random() > 0.5:
+                scale = random.uniform(0.8, 1.2) # 缩放比例
+                w, h = rgb.size
+                new_w, new_h = int(w * scale), int(h * scale)
+                
+                # Resize
+                rgb = TF.resize(rgb, (new_h, new_w), interpolation=transforms.InterpolationMode.BILINEAR)
+                depth = TF.resize(depth, (new_h, new_w), interpolation=transforms.InterpolationMode.NEAREST)
+                label = TF.resize(label, (new_h, new_w), interpolation=transforms.InterpolationMode.NEAREST)
+                
+                # Crop or Pad back to 480x640
+                # 如果变大了，随机裁剪
+                if scale > 1.0:
+                    i, j, h, w = transforms.RandomCrop.get_params(rgb, output_size=(480, 640))
+                    rgb = TF.crop(rgb, i, j, h, w)
+                    depth = TF.crop(depth, i, j, h, w)
+                    label = TF.crop(label, i, j, h, w)
+                # 如果变小了，填充
+                else:
+                    pad_w = 640 - new_w
+                    pad_h = 480 - new_h
+                    padding = (pad_w//2, pad_h//2, pad_w - pad_w//2, pad_h - pad_h//2)
+                    rgb = TF.pad(rgb, padding, fill=0)
+                    depth = TF.pad(depth, padding, fill=0)
+                    label = TF.pad(label, padding, fill=0) # 0 is background
 
         # 转换为 Tensor
         # RGB: (3, H, W), 0-1
         rgb_tensor = transforms.ToTensor()(rgb)
+        rgb_tensor = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(rgb_tensor)
         
         # Depth: (1, H, W), 0-1
         depth_tensor = transforms.ToTensor()(depth)
+        
+        # --- 深度图增强 (模拟 RealSense 噪声) ---
+        if self.split == 'train':
+            # 1. 高斯噪声
+            if random.random() > 0.5:
+                noise = torch.randn_like(depth_tensor) * 0.05 # 5% 的噪声
+                depth_tensor = depth_tensor + noise
+                depth_tensor = torch.clamp(depth_tensor, 0, 1)
+            
+            # 2. 随机丢失 (Dropout) - 模拟深度缺失
+            if random.random() > 0.3:
+                mask = torch.rand_like(depth_tensor) > 0.05 # 5% 的像素丢失
+                depth_tensor = depth_tensor * mask
+
+        depth_tensor = transforms.Normalize(mean=[0.5], std=[0.5])(depth_tensor)
 
         # 合并 RGB 和 Depth -> (4, H, W)
         input_tensor = torch.cat([rgb_tensor, depth_tensor], dim=0)
